@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# Channel source for TV Atlas: the public Famelack dataset
+# (https://data.famelack.com, MIT, https://github.com/famelack/famelack-data).
+# The full TV catalog is downloaded once, normalized into the station shape
+# the UI expects, cached for a day, and every action is answered from it.
+set -euo pipefail
+umask 077
+
+: "${XDG_RUNTIME_DIR:?TV Atlas requires XDG_RUNTIME_DIR}"
+runtime_dir="$XDG_RUNTIME_DIR/omarchy-tv-atlas"
+cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
+cache_dir="$cache_root/omarchy-tv-atlas"
+country_cache_dir="$cache_dir/countries"
+category_cache_dir="$cache_dir/categories"
+install -d -m 700 "$runtime_dir" "$cache_dir" "$country_cache_dir" "$category_cache_dir"
+
+data_root=${FAMELACK_DATA_ROOT:-https://data.famelack.com/tv}
+catalog_file="$cache_dir/catalog.json"
+names_file="$cache_dir/country-names.json"
+world_file="$runtime_dir/world.json"
+results_file="$runtime_dir/results.json"
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+state_path="$script_dir/tv-state"
+version=$(jq -r '.version' "$script_dir/manifest.json")
+user_agent="TVAtlas/$version (Omarchy shell plugin)"
+max_catalog_bytes=33554432
+max_file_bytes=4194304
+data_proto='=https'
+# Tests point FAMELACK_DATA_ROOT at a local fixture directory.
+[[ $data_root != file://* ]] || data_proto='=file'
+catalog_cache_minutes=1440
+id_pattern='[A-Za-z0-9_-]{8,64}'
+categories=(animation auto business classic comedy cooking culture documentary
+  education entertainment family general interactive kids legislative lifestyle
+  movies music news outdoor public relax religious science series shop show
+  sports top-news travel weather)
+request_dir=$(mktemp -d "$runtime_dir/fetch.XXXXXX")
+trap 'rm -rf -- "$request_dir"' EXIT
+
+id_regex="^$id_pattern\$"
+youtube_watch='https://www.youtube.com/watch?v='
+
+# Escapes regex metacharacters so user text can be matched literally with
+# test(...; "i"), which (unlike ascii_downcase) ignores case in any script.
+# fold maps Turkish dotted/dotless i to "i", which case-insensitive matching
+# does not do on its own ("TÜRKİYE" vs "türkiye").
+jq_literal='def literal: gsub("(?<c>[\\\\^$.|?*+()\\[\\]{}])"; "\\\(.c)");
+  def fold: gsub("[İı]"; "i");'
+
+# Famelack row -> station row the UI expects. $names maps "TR" -> "Turkey";
+# $tag labels rows that came from a category file. Direct streams (HLS) are
+# preferred; YouTube embeds become watch URLs that mpv plays through yt-dlp.
+normalize='def clean($limit):
+    if type == "string"
+    then gsub("[\\r\\n\\t]"; " ") | gsub("  +"; " ") | .[0:$limit]
+    else ""
+    end;
+  def compact($limit):
+    if type == "string" then gsub("[\\r\\n\\t ]"; "") | .[0:$limit] else "" end;
+  if type == "array" then . else [] end
+  | map(select(type == "object") | ((.country // "") | clean(2) | ascii_upcase) as $code | {
+    uuid: ((.nanoid // "") | compact(64)),
+    name: (((.name // "Unknown channel") | clean(160)) as $name
+      | if $name == "" then "Unknown channel" else $name end),
+    url: (first((.sources.streams // [])[]? | compact(2048)
+        | select(test("^https?://"; "i")))
+      // first((.sources.youtube // [])[]? | compact(2048)
+        | capture("^https://www\\.youtube(-nocookie)?\\.com/(embed/|watch\\?v=)(?<id>[A-Za-z0-9_-]{11})")
+        | $youtube + .id)
+      // ""),
+    homepage: "",
+    favicon: "",
+    country: (($names[$code] // "") | clean(100)),
+    countryCode: $code,
+    state: "",
+    language: ((.languages // []) | if type == "array" then map(clean(16)) | join(", ") else "" end | .[0:120]),
+    tags: ([$tag, (if .isGeoBlocked == true then "geo-blocked" else "" end)]
+      | map(select(. != "")) | join(", ")),
+    codec: "",
+    bitrate: 0,
+    votes: 0,
+    clicks: 0,
+    latitude: null,
+    longitude: null
+  })
+  | map(.codec = (if .url | startswith($youtube) then "YouTube" else "Live" end))
+  | map(select(
+      (.uuid | test($idre))
+      and (.url | test("^https?://"; "i"))
+      and (.countryCode | test("^[A-Z]{2}$"))
+    ))
+  | reduce .[] as $channel ({seen: {}, rows: []};
+      if .seen[$channel.uuid] then .
+      else .seen[$channel.uuid] = true | .rows += [$channel]
+      end)
+  | .rows'
+
+# normalize_file RAW TAG [EXTRA_FILTER]: normalized channel rows on stdout.
+normalize_file() {
+  jq -c --argjson names "$(country_names)" --arg tag "$2" --arg idre "$id_regex" \
+    --arg youtube "$youtube_watch" "$normalize ${3:-}" "$1"
+}
+
+download() {
+  local path=$1 output=$2 limit=$3
+  setpriv --pdeathsig TERM curl --fail --silent --show-error --compressed \
+    --connect-timeout 5 --max-time 60 --retry 2 --retry-all-errors \
+    --max-filesize "$limit" --proto "$data_proto" --user-agent "$user_agent" \
+    "$data_root/$path" --output "$output" \
+    && (( $(stat -c '%s' -- "$output") <= limit )) \
+    && jq -e 'type == "array" or type == "object"' "$output" >/dev/null 2>&1 \
+    || { echo 'Famelack is unavailable' >&2; return 1; }
+}
+
+fresh() {
+  [[ -s $1 ]] && find "$1" -mmin "-$catalog_cache_minutes" -print -quit | grep -q .
+}
+
+valid_array() {
+  [[ -s $1 ]] && (( $(stat -c '%s' -- "$1") <= max_catalog_bytes )) \
+    && jq -e 'type == "array" and length > 0' "$1" >/dev/null 2>&1
+}
+
+country_names() {
+  if [[ -s $names_file ]]; then cat "$names_file"; else echo '{}'; fi
+}
+
+refresh_names() {
+  local raw="$request_dir/names.raw" temporary
+  download countries_metadata.json "$raw" "$max_file_bytes" || return 1
+  temporary=$(mktemp "$cache_dir/names.XXXXXX")
+  jq -c 'if type == "object" then with_entries(
+      select(.key | test("^[A-Z]{2}$"))
+      | .value = ((.value.country // "") | tostring | .[0:100]))
+    else {} end' "$raw" > "$temporary" && mv "$temporary" "$names_file"
+}
+
+refresh_catalog() {
+  local raw="$request_dir/all.raw" temporary
+  fresh "$names_file" || refresh_names || true
+  download categories/all.json "$raw" "$max_catalog_bytes" || return 1
+  temporary=$(mktemp "$cache_dir/catalog.XXXXXX")
+  if normalize_file "$raw" "" > "$temporary" && valid_array "$temporary"; then
+    mv "$temporary" "$catalog_file"
+    return 0
+  fi
+  rm -f "$temporary"
+  echo 'Famelack returned invalid channel data' >&2
+  return 1
+}
+
+refresh_catalog_in_background() {
+  (
+    exec 9>"$cache_dir/catalog.lock"
+    flock -n 9 || exit 0
+    request_dir=$(mktemp -d "$runtime_dir/fetch.XXXXXX")
+    trap 'rm -rf -- "$request_dir"' EXIT
+    refresh_catalog
+  ) </dev/null >/dev/null 2>&1 &
+}
+
+# Make sure a usable catalog exists; refresh a stale one without blocking.
+ensure_catalog() {
+  if valid_array "$catalog_file"; then
+    fresh "$catalog_file" || refresh_catalog_in_background
+    return 0
+  fi
+  exec 9>"$cache_dir/catalog.lock"
+  flock 9
+  valid_array "$catalog_file" || refresh_catalog
+  exec 9>&-
+}
+
+publish() {
+  local target=$1 temporary
+  temporary=$(mktemp "${target%/*}/publish.XXXXXX")
+  cat > "$temporary"
+  mv "$temporary" "$target"
+  cat "$target"
+}
+
+# 500 channels spread across countries: round-robin over each country's list.
+fetch_world() {
+  ensure_catalog
+  jq -c 'group_by(.countryCode)
+    | map(to_entries) | add | sort_by(.key) | map(.value) | .[:500]' \
+    "$catalog_file" > "$request_dir/world.json"
+  publish "$world_file" < "$request_dir/world.json" >/dev/null
+  publish "$results_file" < "$request_dir/world.json"
+}
+
+fetch_world_more() {
+  ensure_catalog
+  jq -c '.[]' "$catalog_file" | shuf -n 500 | jq -sc .
+}
+
+fetch_country() {
+  local code=$1 lower=${1,,}
+  local target="$country_cache_dir/$code.json" raw="$request_dir/country.raw" temporary
+  if ! { valid_array "$target" && fresh "$target"; }; then
+    temporary=$(mktemp "$country_cache_dir/refresh.XXXXXX")
+    # $code is validated as two uppercase letters, so it is safe in the filter.
+    if download "countries/$lower.json" "$raw" "$max_file_bytes" \
+        && normalize_file "$raw" "" "| map(select(.countryCode == \"$code\")) | .[:500]" \
+          > "$temporary" \
+        && valid_array "$temporary"; then
+      mv "$temporary" "$target"
+    else
+      rm -f "$temporary"
+    fi
+  fi
+  if valid_array "$target"; then
+    publish "$results_file" < "$target"
+    return
+  fi
+  # Offline fallback: the cached catalog.
+  ensure_catalog
+  jq -c --arg code "$code" '[.[] | select(.countryCode == $code)][:500]' "$catalog_file" \
+    | publish "$results_file"
+}
+
+category_for() {
+  local slug=${1,,} category
+  slug=${slug//[[:space:]]/-}
+  [[ $slug == "topnews" ]] && slug=top-news
+  for category in "${categories[@]}"; do
+    [[ $slug == "$category" ]] && { printf '%s\n' "$category"; return 0; }
+  done
+  return 0
+}
+
+category_channels() {
+  local category=$1
+  local target="$category_cache_dir/$category.json" raw="$request_dir/category.raw" temporary
+  if ! { valid_array "$target" && fresh "$target"; }; then
+    temporary=$(mktemp "$category_cache_dir/refresh.XXXXXX")
+    if download "categories/$category.json" "$raw" "$max_catalog_bytes" \
+        && normalize_file "$raw" "$category" > "$temporary" && valid_array "$temporary"; then
+      mv "$temporary" "$target"
+    else
+      rm -f "$temporary"
+    fi
+  fi
+  if valid_array "$target"; then cat "$target"; else echo '[]'; fi
+}
+
+fetch_search() {
+  local query=$1 country_code category genre="$request_dir/genre.json"
+  # Country names may be typed in any case and script ("Türkiye", "TÜRKIYE").
+  country_code=$(jq -r --arg q "$query" "$jq_literal"'
+    ("^" + ($q | gsub("^\\s+|\\s+$"; "") | fold | literal) + "$") as $exact
+    | first(to_entries[] | select(.key | fold | test($exact; "i")) | .value) // ""
+  ' "$script_dir/assets/country-search.json" 2>/dev/null) || country_code=""
+  category=$(category_for "$query")
+  echo '[]' > "$genre"
+  [[ -z $category ]] || category_channels "$category" > "$genre"
+  ensure_catalog
+  jq -c --arg q "$query" --arg code "$country_code" --slurpfile genre "$genre" "$jq_literal"'
+    ($q | gsub("^\\s+|\\s+$"; "") | fold | literal) as $needle
+    | ([.[] | select(.name | fold | test($needle; "i"))][:120]) as $byName
+    | (if $code == "" then [] else [.[] | select(.countryCode == $code)][:120] end) as $byCountry
+    | ([.[] | select(.language | split(", ") | any(test("^" + $needle + "$"; "i")))][:60]) as $byLanguage
+    | ($byName + $byCountry + ($genre[0][:120]) + $byLanguage)
+    | reduce .[] as $s ({seen: {}, rows: []};
+        if .seen[$s.uuid] then . else .seen[$s.uuid] = true | .rows += [$s] end)
+    | .rows[:240]' "$catalog_file" | publish "$results_file"
+}
+
+fetch_random() {
+  local exclusions=$1
+  ensure_catalog
+  jq -c --arg exclusions "$exclusions" '
+    ($exclusions | split(",") | map(select(length > 0))
+      | map({key: ., value: true}) | from_entries) as $excluded
+    | .[] | select($excluded[.uuid] != true)' "$catalog_file" \
+    | shuf -n 60 | jq -sc . | publish "$results_file"
+}
+
+resolve_channels() {
+  local uuids=$1
+  [[ $uuids =~ ^$id_pattern(,$id_pattern)*$ ]] || { echo 'Invalid channel ids' >&2; exit 2; }
+  (( ${#uuids} <= 4096 )) || { echo 'Too many channel ids' >&2; exit 2; }
+  ensure_catalog
+  jq -c --arg ids "$uuids" '
+    ($ids | split(",") | map({key: ., value: true}) | from_entries) as $wanted
+    | [.[] | select($wanted[.uuid] == true)]' "$catalog_file"
+}
+
+action=${1:-world}
+case "$action" in
+  world)
+    fetch_world
+    ;;
+  country)
+    code=${2:-}
+    [[ $code =~ ^[A-Za-z]{2}$ ]] || { echo 'Country code must contain two letters' >&2; exit 2; }
+    fetch_country "${code^^}"
+    ;;
+  search)
+    query=${2:-}
+    [[ -n ${query//[[:space:]]/} ]] || { echo 'Search text is empty' >&2; exit 2; }
+    (( ${#query} <= 128 )) || { echo 'Search text is too long' >&2; exit 2; }
+    fetch_search "$query"
+    ;;
+  world-more)
+    fetch_world_more
+    ;;
+  random)
+    exclusions=${2:-}
+    if [[ -n $exclusions ]]; then
+      [[ $exclusions =~ ^$id_pattern(,$id_pattern)*$ ]] \
+        || { echo 'Invalid excluded channel ids' >&2; exit 2; }
+      (( ${#exclusions} <= 4096 )) || { echo 'Too many excluded channel ids' >&2; exit 2; }
+    fi
+    saved_exclusions=$("$state_path" get 2>/dev/null | jq -r --arg idre "$id_regex" '
+      [.recent[]?.uuid | select(type == "string") | select(test($idre))][:30]
+      | join(",")' 2>/dev/null || true)
+    exclusions=$(jq -nr --arg requested "$exclusions" --arg saved "$saved_exclusions" '
+      [$requested, $saved] | map(split(",")) | add | map(select(length > 0)) | unique | join(",")')
+    fetch_random "$exclusions"
+    ;;
+  resolve)
+    resolve_channels "${2:-}"
+    ;;
+  *)
+    echo "Unknown action: $action" >&2
+    exit 2
+    ;;
+esac

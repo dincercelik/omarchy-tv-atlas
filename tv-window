@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+width=${1:-}
+height=${2:-}
+
+[[ $width =~ ^[0-9]+$ && $height =~ ^[0-9]+$ ]] || {
+  echo "usage: tv-window WIDTH HEIGHT" >&2
+  exit 2
+}
+
+[[ $(hyprctl -j status | jq -r '.configProvider // ""') == lua ]] || exit 2
+
+read -r -d '' setup <<LUA || true
+if _G.omarchy_tv_atlas_window_handler then
+  _G.omarchy_tv_atlas_window_handler:remove()
+  _G.omarchy_tv_atlas_window_handler = nil
+end
+
+if _G.omarchy_tv_atlas_window_rule then
+  _G.omarchy_tv_atlas_window_rule:set_enabled(false)
+end
+
+_G.omarchy_tv_atlas_window_rule = hl.window_rule({
+  name = "tv-atlas-plugin",
+  match = {
+    initial_class = "^org[.]quickshell$",
+    initial_title = "^TV Atlas$",
+  },
+  float = true,
+  center = true,
+  size = { $width, $height },
+  no_anim = true,
+  border_size = 0,
+})
+
+-- Video player: open popped out like Omarchy's Super+O (floating, pinned,
+-- tagged "pop"), picture-in-picture sized in the bottom-right corner.
+-- Super+O on the player tiles it; pressing it again pops it back out.
+if _G.omarchy_tv_atlas_player_rule then
+  _G.omarchy_tv_atlas_player_rule:set_enabled(false)
+end
+
+_G.omarchy_tv_atlas_player_rule = hl.window_rule({
+  name = "tv-atlas-player",
+  match = {
+    initial_class = "^tv-atlas$",
+  },
+  float = true,
+  pin = true,
+  size = { 600, 338 },
+  keep_aspect_ratio = true,
+  -- Use the fixed size here: window_w/h still hold mpv's initial size when
+  -- the move is computed, which would push the window past the screen edge.
+  move = { "(monitor_w-600-40)", "(monitor_h-338-40)" },
+  tag = "+pop",
+})
+LUA
+
+response=$(hyprctl eval "$setup")
+[[ $response == ok ]] || {
+  echo "$response" >&2
+  exit 1
+}

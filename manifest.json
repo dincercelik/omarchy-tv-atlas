@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "dincercelik.tv-atlas",
+  "name": "TV Atlas",
+  "version": "1.0.0",
+  "author": "Dincer Celik",
+  "license": "MIT",
+  "description": "Explore live TV from around the world on a rotatable globe, powered by Famelack's public channel dataset. Plays in mpv with Omarchy media controls.",
+  "homepage": "https://github.com/dincercelik/omarchy-tv-atlas",
+  "repository": "https://github.com/dincercelik/omarchy-tv-atlas",
+  "keywords": [
+    "tv",
+    "iptv",
+    "live",
+    "world",
+    "globe",
+    "atlas",
+    "mpris",
+    "famelack"
+  ],
+  "kinds": [
+    "panel",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "TvAtlas.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "TV Atlas",
+    "description": "Open the live TV globe",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

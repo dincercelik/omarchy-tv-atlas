@@ -1,0 +1,6 @@
+.DS_Store
+*.qmlc
+*.jsc
+/videos/
+/docs/verification/
+__pycache__/
